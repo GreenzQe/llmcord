@@ -204,7 +204,7 @@ async def on_message(new_msg):
     # Generate and send response message(s) (can be multiple if response is long)
     curr_content = finish_reason = edit_task = None
     response_msgs = []
-    response_contents = []
+    response_contents = [""]  # Ensure proper initialization of response_contents
 
     embed = discord.Embed()
     for warning in sorted(user_warnings):
@@ -213,24 +213,40 @@ async def on_message(new_msg):
     kwargs = dict(model=model, messages=messages[::-1], stream=True, extra_body=cfg["extra_api_parameters"])
     try:
         async with new_msg.channel.typing():
+            # Log the request being sent to the AI server
+            logging.debug(f"AI Request: {kwargs}")
+
             async for curr_chunk in await openai_client.chat.completions.create(**kwargs):
-                if finish_reason != None:
-                    break
+                # Log the raw response chunk
+                logging.debug(f"AI Response Chunk: {curr_chunk}")
 
-                finish_reason = curr_chunk.choices[0].finish_reason
-
-                prev_content = curr_content or ""
-                curr_content = curr_chunk.choices[0].delta.content or ""
-
-                new_content = prev_content if finish_reason == None else (prev_content + curr_content)
-
-                if response_contents == [] and new_content == "":
+                if not curr_chunk.choices or not curr_chunk.choices[0].delta.content:
+                    logging.warning("Unexpected AI response format or empty response.")
                     continue
 
-                if start_next_msg := response_contents == [] or len(response_contents[-1] + new_content) > max_message_length:
+                # Append the current chunk's content to the accumulated response
+                curr_content = curr_chunk.choices[0].delta.content or ""
+                response_contents[-1] += curr_content
+
+                # Log the accumulated response content
+                logging.debug(f"Accumulated Response Content: {response_contents[-1]}")
+
+                # Check if the response is complete
+                finish_reason = curr_chunk.choices[0].finish_reason
+                if finish_reason:
+                    logging.info(f"AI Response Finished: {finish_reason}")
+                    break
+
+                if response_contents == [] and curr_content == "":
+                    continue
+
+                if start_next_msg := response_contents == [] or len(response_contents[-1] + curr_content) > max_message_length:
                     response_contents.append("")
 
-                response_contents[-1] += new_content
+                response_contents[-1] += curr_content
+
+                # Log the accumulated response content
+                logging.debug(f"Accumulated Response Content: {response_contents[-1]}")
 
                 if not use_plain_responses:
                     ready_to_edit = (edit_task == None or edit_task.done()) and dt.now().timestamp() - last_task_time >= EDIT_DELAY_SECONDS
@@ -250,6 +266,9 @@ async def on_message(new_msg):
                             response_msg = await reply_to_msg.reply(embed=embed, silent=True)
                             response_msgs.append(response_msg)
 
+                            # Log the response message sent to Discord
+                            logging.info(f"Response message sent to Discord (embed): {embed.description}")
+
                             msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
                             await msg_nodes[response_msg.id].lock.acquire()
                         else:
@@ -263,15 +282,20 @@ async def on_message(new_msg):
                     response_msg = await reply_to_msg.reply(content=content, suppress_embeds=True)
                     response_msgs.append(response_msg)
 
+                    # Log the plain response message sent to Discord
+                    logging.info(f"Response message sent to Discord (plain): {content}")
+
                     msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
                     await msg_nodes[response_msg.id].lock.acquire()
 
     except Exception:
         logging.exception("Error while generating response")
-
     for response_msg in response_msgs:
         msg_nodes[response_msg.id].text = "".join(response_contents)
         msg_nodes[response_msg.id].lock.release()
+
+    # Log the final response sent to Discord
+    logging.info(f"Final Response Sent to Discord: {response_contents}")
 
     # Delete oldest MsgNodes (lowest message IDs) from the cache
     if (num_nodes := len(msg_nodes)) > MAX_MESSAGE_NODES:
